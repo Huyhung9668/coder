@@ -1,0 +1,964 @@
+/**
+ * Backtest (LONG + SHORT) with dynamic horizons
+ * Replace btc.gs content with this file.
+ */
+
+/* ========== CONFIG (use var for safe re-runs) ========== */
+var INPUT_SPREADSHEET_ID_1 = "1H-rmR4fXFJ-f7nbIoh65omBs2Cw_bX_qfzBOrQDKg4k";
+var INPUT_SPREADSHEET_ID_2 = "1zhglsbi8vq-QCEK3gQd6V1BI81dOpCPR4-JaLVrK7CM";
+var OUTPUT_SPREADSHEET_ID = INPUT_SPREADSHEET_ID_2;
+
+var HORIZONS = [3, 7, 15, 30]; // default if not overridden at runtime
+var MAX_BASE_SERIES = 20;
+var TS_SPLITS = 3;
+var LR_LEARNING_RATE = 0.06;
+var LR_ITERS = 300;
+var LR_REG = 1e-3;
+var THRESH_GRID = [0.40, 0.45, 0.50, 0.55, 0.60];
+
+/* LONG params */
+var MIN_CONF_LONG_MAP = { "3": 0.05, "7": 0.07, "15": 0.08, "30": 0.10 };
+var HIGH_PROBA_OVERRIDE_UP = 0.75;
+var MIN_PRECISION_UP_MAP = { "3": 0.60, "7": 0.62, "15": 0.65, "30": 0.68 };
+var ALLOW_LONG_IN_BEAR = false;
+var LONG_CLASS_WEIGHT_MAP = { "3": 1.0, "7": 1.2, "15": 1.3, "30": 1.4 };
+
+/* SHORT params (ensure fallback exists) */
+if (typeof MIN_CONF_SHORT_MAP === 'undefined') var MIN_CONF_SHORT_MAP = { "3": 0.04, "7": 0.05, "15": 0.06, "30": 0.08 };
+if (typeof HIGH_PROBA_OVERRIDE_DOWN === 'undefined') var HIGH_PROBA_OVERRIDE_DOWN = 0.70;
+if (typeof MIN_PRECISION_DOWN_MAP === 'undefined') var MIN_PRECISION_DOWN_MAP = { "3": 0.55, "7": 0.57, "15": 0.58, "30": 0.60 };
+if (typeof ALLOW_SHORT_IN_BULL === 'undefined') var ALLOW_SHORT_IN_BULL = true;
+if (typeof SHORT_CLASS_WEIGHT_MAP === 'undefined') var SHORT_CLASS_WEIGHT_MAP = { "3": 4.0, "7": 3.5, "15": 3.0, "30": 2.5 };
+
+/* ========== ENTRY (horizonsInput optional) ========== */
+function runBacktestFinalHybrid(horizonsInput) {
+  const t0 = new Date();
+  // parse horizonsInput if provided (array or comma-separated string)
+  var horizons = parseHorizonsInput(horizonsInput) || HORIZONS;
+  logRun("START runBacktestFinalHybrid horizons=" + JSON.stringify(horizons) + " " + t0.toISOString());
+  try {
+    const dailySeries = loadDailyPriceSeries([INPUT_SPREADSHEET_ID_1, INPUT_SPREADSHEET_ID_2]);
+    if (!dailySeries || dailySeries.length === 0) throw new Error("Daily price series (1D) not found.");
+    logRun("Loaded daily series length: " + dailySeries.length);
+
+    const mergedRows = mergeWorkbooks([INPUT_SPREADSHEET_ID_1, INPUT_SPREADSHEET_ID_2]);
+    const mergedMap = {};
+    if (mergedRows && mergedRows.length) mergedRows.forEach(function(r){ if (r.date) mergedMap[r.date] = r; });
+    logRun("Merged features rows: " + (mergedRows ? mergedRows.length : 0));
+
+    const withTargets = buildTargetsFromDaily(dailySeries, mergedMap, horizons);
+    logRun("Built targets aligned to daily series; rows: " + withTargets.length);
+
+    computeMarketRegime(withTargets, "close");
+    logRun("Computed market_regime on daily series.");
+
+    const feRes = featureEngineeringShortBoost(withTargets, "close", MAX_BASE_SERIES);
+    const feDf = feRes.fe;
+    const featureCols = feRes.featureCols;
+    logRun("Features created: " + featureCols.length + " base: " + (feRes.baseSeries || []).join(","));
+
+    const oof = trainTwoModelsByRegime(feDf, withTargets, "close", featureCols, horizons, TS_SPLITS);
+    logRun("OOF predictions ready: " + oof.length);
+
+    const evalRes = tuneThresholdsAndSimulateHybrid_Dynamic(oof, withTargets, horizons, "close", THRESH_GRID);
+    logRun("Evaluation done. Metrics: " + evalRes.metrics.length + " PnL entries: " + evalRes.pnlSummary.length);
+
+    writeOutputs_Dynamic(OUTPUT_SPREADSHEET_ID, oof, evalRes.metrics, evalRes.pnlSummary, evalRes.waveSummary, evalRes.longWaveOutcomes, evalRes.shortWaveOutcomes);
+    const t1 = new Date();
+    logRun("FINISHED duration(s): " + ((t1 - t0) / 1000).toFixed(1));
+  } catch (e) {
+    logRun("ERROR (runBacktestFinalHybrid): " + (e && e.message ? e.message : e));
+    throw e;
+  }
+}
+
+/* ========== helper: parse horizons input (string or array) ========== */
+function parseHorizonsInput(inp) {
+  if (!inp) return null;
+  if (Array.isArray(inp)) return inp.map(function(x){ return Number(x); }).filter(Boolean);
+  if (typeof inp === "string") {
+    return inp.split(",").map(function(s){ return Number(s.trim()); }).filter(function(x){ return !isNaN(x) && x>0; });
+  }
+  return null;
+}
+
+/* ========== LOAD DAILY PRICE SERIES ========== */
+function loadDailyPriceSeries(ids) {
+  for (let si=0; si<ids.length; si++) {
+    try {
+      const ss = SpreadsheetApp.openById(ids[si]);
+      const sheets = ss.getSheets();
+      for (let k=0;k<sheets.length;k++) {
+        const sh = sheets[k];
+        const nameL = (sh.getName() || "").toLowerCase();
+        if ( (nameL.indexOf("binance") !== -1 && nameL.indexOf("btc") !== -1 && (nameL.indexOf("1") !== -1 || nameL.indexOf("1d") !== -1 || nameL.indexOf("daily") !== -1))
+             || sh.getName().indexOf("BINANCE_BTCUSDT_1") !== -1
+             || (nameL.indexOf("btc") !== -1 && nameL.indexOf("daily") !== -1) ) {
+          const vals = sh.getDataRange().getValues();
+          if (!vals || vals.length < 2) continue;
+          const header = vals[0].map(function(h){ return (h === undefined ? "" : String(h).toLowerCase()); });
+          let dateCol = header.findIndex(h => h.indexOf("date")!==-1 || h.indexOf("time")!==-1);
+          if (dateCol === -1) dateCol = 0;
+          let openCol = header.findIndex(h => h.indexOf("open")!==-1);
+          let highCol = header.findIndex(h => h.indexOf("high")!==-1);
+          let lowCol = header.findIndex(h => h.indexOf("low")!==-1);
+          let closeCol = header.findIndex(h => h.indexOf("close")!==-1 || h === "c");
+          let volCol = header.findIndex(h => h.indexOf("vol")!==-1 || h.indexOf("volume")!==-1);
+          if (closeCol === -1 && header.length >= 2) closeCol = 1;
+          const out = [];
+          for (let r=1;r<vals.length;r++) {
+            const d = parseDate(vals[r][dateCol]);
+            if (!d) continue;
+            const openV = (openCol>=0) ? Number(vals[r][openCol]) : null;
+            const highV = (highCol>=0) ? Number(vals[r][highCol]) : null;
+            const lowV = (lowCol>=0) ? Number(vals[r][lowCol]) : null;
+            const closeV = (closeCol>=0) ? Number(vals[r][closeCol]) : null;
+            const volV = (volCol>=0) ? Number(vals[r][volCol]) : null;
+            out.push({ date: d, open: openV, high: highV, low: lowV, close: closeV, volume: volV });
+          }
+          out.sort(function(a,b){ return a.date < b.date ? -1 : 1; });
+          logRun("Using daily price sheet: " + ss.getName() + " :: " + sh.getName());
+          return out;
+        }
+      }
+    } catch (e) {
+      logRun("WARN cannot open spreadsheet " + ids[si] + " — " + (e.message || e));
+    }
+  }
+  // fallback search any sheet with 'btc'
+  for (let si=0; si<ids.length; si++){
+    try {
+      const ss = SpreadsheetApp.openById(ids[si]);
+      const sheets = ss.getSheets();
+      for (let k=0;k<sheets.length;k++){
+        const sh = sheets[k];
+        const nameL = (sh.getName() || "").toLowerCase();
+        if (nameL.indexOf("btc") !== -1) {
+          const vals = sh.getDataRange().getValues();
+          if (!vals || vals.length < 2) continue;
+          const header = vals[0].map(function(h){ return (h === undefined ? "" : String(h).toLowerCase()); });
+          let dateCol = header.findIndex(h => h.indexOf("date")!==-1 || h.indexOf("time")!==-1);
+          if (dateCol === -1) dateCol = 0;
+          let closeCol = header.findIndex(h => h.indexOf("close")!==-1);
+          if (closeCol === -1 && header.length >= 2) closeCol = 1;
+          const out = [];
+          for (let r=1;r<vals.length;r++){
+            const d = parseDate(vals[r][dateCol]);
+            if (!d) continue;
+            const closeV = (closeCol>=0) ? Number(vals[r][closeCol]) : null;
+            out.push({ date: d, open: null, high: null, low: null, close: closeV, volume: null });
+          }
+          out.sort(function(a,b){ return a.date < b.date ? -1 : 1; });
+          logRun("Fallback daily price sheet: " + ss.getName() + " :: " + sh.getName());
+          return out;
+        }
+      }
+    } catch (e) { continue; }
+  }
+  return [];
+}
+
+/* ========== MERGE WORKBOOKS ========== */
+function mergeWorkbooks(ids) {
+  const tables = [];
+  ids.forEach(function(id) {
+    try {
+      const ss = SpreadsheetApp.openById(id);
+      const sheets = ss.getSheets();
+      for (let i = 0; i < sheets.length; i++) {
+        const sh = sheets[i];
+        const tag = ss.getName() + "::" + sh.getName();
+        const t = sheetToTidy(sh, tag);
+        if (t && t.length) tables.push(t);
+        if (tables.length > 200) break;
+      }
+    } catch (e) {
+      logRun("WARN: cannot open spreadsheet " + id + " — " + (e.message || e));
+    }
+  });
+  if (!tables.length) return [];
+  const dateMap = {};
+  tables.forEach(function(tbl) {
+    tbl.forEach(function(row) {
+      const d = row.date;
+      if (!d) return;
+      if (!dateMap[d]) dateMap[d] = { date: d };
+      Object.keys(row).forEach(function(k) { if (k !== "date") dateMap[d][k] = row[k]; });
+    });
+  });
+  const arr = Object.keys(dateMap).map(function(k) { return dateMap[k]; });
+  arr.sort(function(a,b) { return a.date < b.date ? -1 : 1; });
+  return arr;
+}
+function sheetToTidy(sheet, tag) {
+  const vals = sheet.getDataRange().getValues();
+  if (!vals || vals.length < 2) return [];
+  const header = vals[0].map(function(h){ return (h === undefined ? "" : String(h)); });
+  let dateCol = -1;
+  for (let c = 0; c < header.length; c++) {
+    const h = header[c].toLowerCase();
+    if (h.indexOf("date") !== -1 || h.indexOf("time") !== -1 || h.indexOf("timestamp") !== -1 || h.indexOf("ngày") !== -1) { dateCol = c; break; }
+  }
+  if (dateCol === -1) dateCol = 0;
+  const numericCols = [];
+  for (let c = 0; c < header.length; c++) {
+    if (c === dateCol) continue;
+    let cnt = 0;
+    for (let r = 1; r < Math.min(vals.length, 200); r++) {
+      const v = vals[r][c];
+      if (v !== null && v !== "" && !isNaN(Number(v))) cnt++;
+    }
+    if (cnt >= Math.min(10, vals.length - 1)) numericCols.push(c);
+  }
+  if (!numericCols.length) {
+    if (header.length >= 2) {
+      const out = [];
+      for (let r = 1; r < vals.length; r++) {
+        const d = parseDate(vals[r][dateCol]);
+        const v = Number(vals[r][1]);
+        if (d && !isNaN(v)) out.push({ date: d, [tag + "::value"]: v });
+      }
+      return out;
+    }
+    return [];
+  }
+  const out = [];
+  for (let r = 1; r < vals.length; r++) {
+    const d = parseDate(vals[r][dateCol]);
+    if (!d) continue;
+    const row = { date: d };
+    numericCols.forEach(function(c) {
+      const rn = header[c] || ("col" + c);
+      const name = tag + "::" + rn;
+      const v = vals[r][c];
+      row[name] = (v === null || v === "") ? null : Number(v);
+    });
+    out.push(row);
+  }
+  return out;
+}
+
+/* ========== BUILD TARGETS from dailySeries (dynamic horizons) ========== */
+function buildTargetsFromDaily(dailySeries, mergedMap, horizons) {
+  const out = dailySeries.map(function(r){ return Object.assign({}, r); });
+  for (let i=0;i<out.length;i++){
+    const d = out[i].date;
+    if (mergedMap[d]) {
+      Object.keys(mergedMap[d]).forEach(function(k){ if (k !== "date") out[i][k] = mergedMap[d][k]; });
+    }
+  }
+  for (let hi=0; hi<horizons.length; hi++){
+    const h = horizons[hi];
+    const prefix = "_" + h + "d";
+    for (let i=0;i<out.length;i++){
+      const j = i + h;
+      out[i]["ret" + prefix] = null;
+      out[i]["trend_up" + prefix] = null;
+      out[i]["trend_down" + prefix] = null;
+      out[i]["exit_date" + prefix] = null;
+      out[i]["timing" + prefix] = null;
+      out[i]["entry_price" + prefix] = null;
+      out[i]["exit_price" + prefix] = null;
+      out[i]["max_price_win" + prefix] = null;
+      out[i]["min_price_win" + prefix] = null;
+      out[i]["duration_days" + prefix] = null;
+
+      if (j < out.length && out[i].close != null && out[j].close != null) {
+        const entry_price = Number(out[i].close);
+        const exit_price = Number(out[j].close);
+        let maxp = -Infinity, minp = Infinity;
+        for (let k=i;k<=j;k++){
+          const v = out[k].close;
+          if (v == null || isNaN(Number(v))) continue;
+          const vv = Number(v);
+          if (vv > maxp) maxp = vv;
+          if (vv < minp) minp = vv;
+        }
+        if (!isFinite(maxp)) maxp = null;
+        if (!isFinite(minp)) minp = null;
+        const ret = (exit_price - entry_price) / entry_price;
+        out[i]["ret" + prefix] = ret;
+        out[i]["trend_up" + prefix] = ret > 0 ? 1 : 0;
+        out[i]["trend_down" + prefix] = ret < 0 ? 1 : 0;
+        out[i]["exit_date" + prefix] = out[j].date;
+        out[i]["timing" + prefix] = h;
+        out[i]["entry_price" + prefix] = entry_price;
+        out[i]["exit_price" + prefix] = exit_price;
+        out[i]["max_price_win" + prefix] = maxp;
+        out[i]["min_price_win" + prefix] = minp;
+        try {
+          const d0 = new Date(out[i].date);
+          const d1 = new Date(out[j].date);
+          const dur = Math.round((d1 - d0) / (1000*3600*24));
+          out[i]["duration_days" + prefix] = (isFinite(dur) && !isNaN(dur)) ? dur : null;
+        } catch (e) {
+          out[i]["duration_days" + prefix] = null;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* ========== computeMarketRegime (uses priceCol 'close') ========== */
+function computeMarketRegime(rows, priceCol) {
+  const ma200 = new Array(rows.length).fill(null);
+  for (let i = 0; i < rows.length; i++) {
+    if (i >= 199) {
+      let s = 0, c = 0;
+      for (let j = i - 199; j <= i; j++) { if (rows[j][priceCol] != null) { s += Number(rows[j][priceCol]); c++; } }
+      ma200[i] = c ? s / c : null;
+    }
+  }
+  const spxKey = Object.keys(rows[0] || {}).find(function(k){ const kl = String(k).toLowerCase(); return kl.indexOf("spx") !== -1 || kl.indexOf("s&p") !== -1; });
+  const spxMa200 = new Array(rows.length).fill(null);
+  if (spxKey) {
+    for (let i = 0; i < rows.length; i++) {
+      if (i >= 199) {
+        let s = 0, c = 0;
+        for (let j = i - 199; j <= i; j++) { if (rows[j][spxKey] != null) { s += Number(rows[j][spxKey]); c++; } }
+        spxMa200[i] = c ? s / c : null;
+      }
+    }
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const p = rows[i][priceCol];
+    const btcBear = (ma200[i] != null && p != null && p < ma200[i]);
+    const spxBear = (spxKey && spxMa200[i] != null && rows[i][spxKey] != null && rows[i][spxKey] < spxMa200[i]);
+    rows[i]["market_regime"] = (btcBear || spxBear) ? "bear" : "bull";
+    rows[i]["ma200"] = ma200[i];
+    if (spxKey) rows[i]["spx_ma200"] = spxMa200[i];
+  }
+}
+
+/* ========== FEATURE ENGINEERING (short-boost) ========== */
+function featureEngineeringShortBoost(withTargets, priceCol, maxBases) {
+  const sample = withTargets.find(function(r){ return r; });
+  const numericKeys = Object.keys(sample || {}).filter(function(k) {
+    return k !== "date" && !k.startsWith("ret_") && !k.startsWith("trend_") && !k.startsWith("exit_date_") && !k.startsWith("timing_") && !k.startsWith("entry_price_") && k !== "market_regime";
+  });
+  const priority = ["btcusdt","btc","btc.d","usdt","usdt.d","open_interest","netflow","exchange","funding","sopr","fear","spx","dxy","vix","etf"];
+  let picked = numericKeys.filter(function(k){ return priority.some(function(p){ return k.toLowerCase().indexOf(p)!==-1; }); });
+  if (picked.indexOf(priceCol) === -1) picked.unshift(priceCol);
+
+  const variances = numericKeys.map(function(k) {
+    const vals = withTargets.map(function(r){ return r[k]; }).filter(function(v){ return v != null && !isNaN(Number(v)); }).map(Number);
+    const mean = vals.length ? vals.reduce(function(a,b){ return a+b; },0)/vals.length : 0;
+    const varr = vals.length ? vals.reduce(function(a,b){ return a+Math.pow(b-mean,2); },0)/vals.length : 0;
+    return {k:k, varr:varr};
+  }).sort(function(a,b){ return b.varr - a.varr; });
+  for (let i = 0; i < variances.length; i++) {
+    if (picked.length >= maxBases) break;
+    if (picked.indexOf(variances[i].k) === -1) picked.push(variances[i].k);
+  }
+  picked = picked.slice(0, maxBases);
+
+  const fe = withTargets.map(function(r){ return { date: r.date }; });
+  const inflowKeys = numericKeys.filter(function(k){ return ["netflow","inflow","exchange","flow"].some(function(s){ return k.toLowerCase().indexOf(s) !== -1; }); });
+
+  for (let p = 0; p < picked.length; p++) {
+    const k = picked[p];
+    for (let i = 0; i < withTargets.length; i++) {
+      const cur = withTargets[i];
+      const prev1 = i-1 >= 0 ? withTargets[i-1][k] : null;
+      const prev3 = i-3 >= 0 ? withTargets[i-3][k] : null;
+      const prev7 = i-7 >= 0 ? withTargets[i-7][k] : null;
+      const ma3 = (function(){ let s=0,c=0; for (let j=i-2;j<=i;j++){ if (j>=0 && withTargets[j] && withTargets[j][k]!=null){ s+=Number(withTargets[j][k]); c++; } } return c? s/c : null; })();
+      const ma7 = (function(){ let s=0,c=0; for (let j=i-6;j<=i;j++){ if (j>=0 && withTargets[j] && withTargets[j][k]!=null){ s+=Number(withTargets[j][k]); c++; } } return c? s/c : null; })();
+      const vals = [];
+      for (let j = i-6; j <= i; j++) { if (j >= 0 && withTargets[j] && withTargets[j][k] != null) vals.push(Number(withTargets[j][k])); }
+      const std7 = (vals.length <= 1) ? null : (function(){ const mean = vals.reduce(function(a,b){ return a+b; },0)/vals.length; return Math.sqrt(vals.reduce(function(a,b){ return a+Math.pow(b-mean,2); },0)/vals.length); })();
+      const ret1 = (cur[k] != null && prev1 != null && !isNaN(Number(cur[k])) && !isNaN(Number(prev1))) ? (Number(cur[k]) - Number(prev1)) / Number(prev1) : null;
+      const roc3 = (cur[k] != null && prev3 != null) ? (Number(cur[k]) - Number(prev3)) / Number(prev3) : null;
+
+      fe[i][k + "__ret1"] = ret1;
+      fe[i][k + "__lag1"] = prev1 != null ? Number(prev1) : null;
+      fe[i][k + "__lag3"] = prev3 != null ? Number(prev3) : null;
+      fe[i][k + "__lag7"] = prev7 != null ? Number(prev7) : null;
+      fe[i][k + "__ma3"] = ma3;
+      fe[i][k + "__ma7"] = ma7;
+      fe[i][k + "__std7"] = std7;
+      fe[i][k + "__roc3"] = roc3;
+    }
+  }
+
+  for (let i = 0; i < withTargets.length; i++) {
+    const p = withTargets[i][priceCol];
+    const p3 = i-3>=0 ? withTargets[i-3][priceCol] : null;
+    const p7 = i-7>=0 ? withTargets[i-7][priceCol] : null;
+    fe[i]["price__roc3"] = (p!=null && p3!=null) ? (p - p3) / p3 : null;
+    fe[i]["price__roc7"] = (p!=null && p7!=null) ? (p - p7) / p7 : null;
+    fe[i]["price__neg_mom_3"] = (fe[i]["price__roc3"] != null && fe[i]["price__roc3"] < 0) ? 1 : 0;
+  }
+
+  for (let i = 0; i < withTargets.length; i++) {
+    let sum3 = 0, c = 0;
+    for (let k = 0; k < inflowKeys.length; k++) {
+      const key = inflowKeys[k];
+      const v = withTargets[i][key];
+      if (v != null && !isNaN(Number(v))) { sum3 += Number(v); c++; }
+      const v1 = i-1>=0 ? withTargets[i-1][key] : null;
+      const v2 = i-2>=0 ? withTargets[i-2][key] : null;
+      if (v1 != null && !isNaN(Number(v1))) { sum3 += Number(v1); c++; }
+      if (v2 != null && !isNaN(Number(v2))) { sum3 += Number(v2); c++; }
+    }
+    fe[i]["inflow3_sum"] = c ? (sum3 / c) : null;
+  }
+
+  function findKeyContains(sub) { for (let i=0;i<picked.length;i++) if (picked[i].toLowerCase().indexOf(sub)!==-1) return picked[i]; return null; }
+  const fundingKey = findKeyContains("funding") || findKeyContains("fund");
+  const oiKey = findKeyContains("open_interest") || findKeyContains("open interest");
+  const usdtKey = findKeyContains("usdt");
+  const btcDKey = findKeyContains("btc.d") || findKeyContains("dominance");
+  const dxyKey = findKeyContains("dxy");
+  const spxKey = findKeyContains("spx");
+  if (fundingKey && oiKey) addInteraction(fe, withTargets, fundingKey, oiKey, "INTER_FUNDxOI");
+  if (usdtKey && btcDKey) addInteraction(fe, withTargets, usdtKey, btcDKey, "INTER_USDTxBTCD");
+  if (dxyKey && spxKey) addInteraction(fe, withTargets, dxyKey, spxKey, "INTER_DXYxSPX");
+
+  for (let i = 1; i < fe.length; i++) {
+    const keys = Object.keys(fe[i]);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const k2 = keys[ki];
+      if (k2 === "date") continue;
+      if (fe[i][k2] == null || (typeof fe[i][k2] === "number" && isNaN(fe[i][k2]))) fe[i][k2] = fe[i-1][k2];
+    }
+  }
+  for (let i = fe.length - 2; i >= 0; i--) {
+    const keys = Object.keys(fe[i]);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const k2 = keys[ki];
+      if (k2 === "date") continue;
+      if (fe[i][k2] == null || (typeof fe[i][k2] === "number" && isNaN(fe[i][k2]))) fe[i][k2] = fe[i+1][k2];
+    }
+  }
+
+  const featureCols = Object.keys(fe[0] || {}).filter(function(k){ return k !== "date"; });
+  const feWithPrice = fe.map(function(r,i){ const o = Object.assign({}, r); o[priceCol] = withTargets[i][priceCol]; o["market_regime"] = withTargets[i]["market_regime"]; return o; });
+
+  logRun("featureEngineeringShortBoost done; features: " + featureCols.length);
+  return { fe: feWithPrice, featureCols: featureCols, baseSeries: picked };
+}
+function addInteraction(fe, withTargets, a, b, name) {
+  for (let i = 0; i < withTargets.length; i++) {
+    const va = withTargets[i][a], vb = withTargets[i][b];
+    fe[i][name] = (va != null && vb != null) ? (Number(va) * Number(vb)) : null;
+  }
+}
+
+/* ========== REGIME-AWARE TRAINING (weighted) ========== */
+function trainTwoModelsByRegime(feDf, withTargets, priceCol, featureCols, horizons, nSplits) {
+  logRun("trainTwoModelsByRegime start");
+  const rows = feDf;
+  const Xraw = rows.map(function(r){ return featureCols.map(function(c){ return Number(r[c] == null ? 0 : r[c]); }); });
+  const m = featureCols.length;
+  const means = new Array(m).fill(0), sds = new Array(m).fill(1);
+  for (let j=0;j<m;j++){
+    const vals = Xraw.map(function(rr){ return rr[j]; }).filter(function(v){ return !isNaN(v); });
+    const mean = vals.length ? vals.reduce(function(a,b){ return a+b; },0)/vals.length : 0;
+    const sd = vals.length ? Math.sqrt(vals.reduce(function(a,b){ return a+Math.pow(b-mean,2); },0)/vals.length) : 1;
+    means[j]=mean; sds[j]= sd || 1;
+    for (let i=0;i<Xraw.length;i++) Xraw[i][j] = (Xraw[i][j] - mean)/sds[j];
+  }
+  const X = Xraw.map(function(r){ return [1].concat(r); });
+  const oofRows = [];
+
+  for (let hi=0; hi<horizons.length; hi++) {
+    const h = horizons[hi];
+    const up_col = "trend_up_" + h + "d";
+    const down_col = "trend_down_" + h + "d";
+
+    const validIdx = [];
+    for (let i=0;i<withTargets.length;i++){ if (withTargets[i][up_col] !== null && withTargets[i][down_col] !== null) validIdx.push(i); }
+    const idxSubset = validIdx.slice(Math.max(0, validIdx.length - 2000));
+    logRun("horizon " + h + "d: validIdx=" + validIdx.length + " idxSubset=" + idxSubset.length);
+    if (idxSubset.length < 20) { logRun("Skipping horizon " + h + "d due too few samples: " + idxSubset.length); continue; }
+
+    const idxByRegime = { bull: [], bear: [] };
+    for (let k=0;k<idxSubset.length;k++){
+      const orig = idxSubset[k];
+      const reg = withTargets[orig]["market_regime"] || "bull";
+      if (!idxByRegime[reg]) idxByRegime[reg] = [];
+      idxByRegime[reg].push(orig);
+    }
+
+    const oofPerRegime = {};
+    const regimes = Object.keys(idxByRegime);
+    regimes.forEach(function(reg){
+      const arr = idxByRegime[reg];
+      if (!arr || arr.length === 0) return;
+      const n = arr.length;
+      let splits = [];
+      const foldSize = Math.floor(n / (nSplits + 1));
+      for (let f=0; f<nSplits; f++){
+        const trainEnd = (f+1)*foldSize;
+        const valStart = trainEnd;
+        const valEnd = Math.min(n, valStart + foldSize);
+        if (trainEnd < 10 || valEnd - valStart < 1) continue;
+        splits.push({ train: range(0, trainEnd), val: range(valStart, valEnd) });
+      }
+      if (splits.length === 0) {
+        const trainEnd = Math.floor(n*0.6);
+        const valStart = trainEnd;
+        const valEnd = n;
+        if (trainEnd >= 10 && valEnd - valStart >= 1) splits.push({ train: range(0, trainEnd), val: range(valStart, valEnd) });
+      }
+
+      const oofUpLocal = new Array(n).fill(null);
+      const oofDownLocal = new Array(n).fill(null);
+
+      for (let si=0; si<splits.length; si++){
+        const sp = splits[si];
+        const Xtr = sp.train.map(function(ii){ return X[arr[ii]]; });
+        const Yup = sp.train.map(function(ii){ return Number(withTargets[arr[ii]][up_col]); });
+        const Ydown = sp.train.map(function(ii){ return Number(withTargets[arr[ii]][down_col]); });
+        const Xva = sp.val.map(function(ii){ return X[arr[ii]]; });
+
+        const lw = (typeof LONG_CLASS_WEIGHT_MAP !== 'undefined' && LONG_CLASS_WEIGHT_MAP[String(h)]) ? LONG_CLASS_WEIGHT_MAP[String(h)] : 1;
+        const sw = (typeof SHORT_CLASS_WEIGHT_MAP !== 'undefined' && SHORT_CLASS_WEIGHT_MAP[String(h)]) ? SHORT_CLASS_WEIGHT_MAP[String(h)] : 1;
+        const weightsUp = Yup.map(function(v){ return (v === 1) ? lw : 1; });
+        const weightsDown = Ydown.map(function(v){ return (v === 1) ? sw : 1; });
+
+        if (uniqueCount(Yup) > 1) {
+          const wUp = trainLogisticGDWeighted(Xtr, Yup, weightsUp, LR_LEARNING_RATE, LR_ITERS, LR_REG);
+          const pUp = predictProbaFromWeights(Xva, wUp);
+          for (let k=0;k<sp.val.length;k++) oofUpLocal[sp.val[k]] = pUp[k];
+        }
+        if (uniqueCount(Ydown) > 1) {
+          const wDown = trainLogisticGDWeighted(Xtr, Ydown, weightsDown, LR_LEARNING_RATE, LR_ITERS, LR_REG);
+          const pDown = predictProbaFromWeights(Xva, wDown);
+          for (let k=0;k<sp.val.length;k++) oofDownLocal[sp.val[k]] = pDown[k];
+        }
+      }
+
+      for (let li=0; li<oofUpLocal.length; li++){
+        if (oofUpLocal[li] == null || isNaN(oofUpLocal[li])) oofUpLocal[li] = 0.5;
+        if (oofDownLocal[li] == null || isNaN(oofDownLocal[li])) oofDownLocal[li] = 0.5;
+      }
+
+      for (let li=0; li<oofUpLocal.length; li++) {
+        const globalIdx = arr[li];
+        oofPerRegime[globalIdx] = { proba_up: oofUpLocal[li], proba_down: oofDownLocal[li], regime: reg };
+      }
+      logRun("Regime " + reg + " horizon " + h + "d processed; n=" + n + " splits=" + splits.length);
+    });
+
+    for (let ii = 0; ii < idxSubset.length; ii++) {
+      const globalIdx = idxSubset[ii];
+      const rec = oofPerRegime[globalIdx];
+      const fallback = { proba_up: 0.5, proba_down: 0.5, regime: withTargets[globalIdx]["market_regime"] || "bull" };
+      const used = rec || fallback;
+      const entry_price = withTargets[globalIdx]["entry_price_" + h + "d"] || null;
+      const exit_price = withTargets[globalIdx]["exit_price_" + h + "d"] || null;
+      const maxp = withTargets[globalIdx]["max_price_win_" + h + "d"] || null;
+      const minp = withTargets[globalIdx]["min_price_win_" + h + "d"] || null;
+      const dur = withTargets[globalIdx]["duration_days_" + h + "d"] || null;
+      const realized_ret = withTargets[globalIdx]["ret_" + h + "d"] || null;
+
+      oofRows.push({
+        date: withTargets[globalIdx].date,
+        horizon: h + "d",
+        price: withTargets[globalIdx].close,
+        entry_price: entry_price,
+        exit_price: exit_price,
+        max_price_in_window: maxp,
+        min_price_in_window: minp,
+        duration_days: dur,
+        realized_ret: realized_ret,
+        actual_up: withTargets[globalIdx]["trend_up_" + h + "d"],
+        actual_down: withTargets[globalIdx]["trend_down_" + h + "d"],
+        proba_up: used.proba_up,
+        proba_down: used.proba_down,
+        regime: used.regime,
+        price_neg_mom3: rows[globalIdx]["price__neg_mom_3"],
+        inflow3_sum: rows[globalIdx]["inflow3_sum"],
+        exit_date: withTargets[globalIdx]["exit_date_" + h + "d"],
+        timing: withTargets[globalIdx]["timing_" + h + "d"]
+      });
+    }
+  }
+  logRun("trainTwoModelsByRegime finished; oofRows=" + oofRows.length);
+  return oofRows;
+}
+
+/* ========== TRAIN LOGISTIC WITH SAMPLE WEIGHTS ========== */
+function trainLogisticGDWeighted(X, y, sampleWeights, lr, iters, reg) {
+  const n = X.length; if (n === 0) return [];
+  const m = X[0].length;
+  let w = new Array(m).fill(0);
+  const meanW = sampleWeights.reduce(function(a,b){return a+b;},0)/sampleWeights.length;
+  const wnorm = sampleWeights.map(function(v){ return v / (meanW || 1); });
+
+  for (let it=0; it<iters; it++) {
+    const grad = new Array(m).fill(0);
+    for (let i=0;i<n;i++) {
+      const xi = X[i];
+      let z = 0;
+      for (let j=0;j<m;j++) z += w[j] * xi[j];
+      const p = sigmoid(z);
+      const err = p - y[i];
+      const sw = wnorm[i];
+      for (let j=0;j<m;j++) grad[j] += err * xi[j] * sw;
+    }
+    for (let j=0;j<m;j++) {
+      const g = (grad[j] / n) + (reg * w[j]);
+      w[j] -= lr * g;
+      if (!isFinite(w[j])) w[j] = 0;
+    }
+  }
+  return w;
+}
+function sigmoid(z) { return 1 / (1 + Math.exp(-Math.max(Math.min(z,50), -50))); }
+function predictProbaFromWeights(X, w) {
+  const out = [];
+  if (!X || X.length === 0) return out;
+  for (let i=0;i<X.length;i++) {
+    let z = 0;
+    for (let j=0;j<X[0].length;j++) z += w[j] * X[i][j];
+    const p = sigmoid(z);
+    out.push((isFinite(p) && !isNaN(p)) ? p : 0.5);
+  }
+  return out;
+}
+function uniqueCount(arr) { return Array.from(new Set(arr)).length; }
+
+/* ========== TUNE & SIMULATE (dynamic horizons, LONG+SHORT) ========== */
+function tuneThresholdsAndSimulateHybrid_Dynamic(oofRows, withTargets, horizons, priceCol, grid) {
+  const metrics = [];
+  const pnlSummary = [];
+  const group = {};
+  oofRows.forEach(function(r){ const key = r.horizon + "::" + (r.regime || "bull"); if (!group[key]) group[key]=[]; group[key].push(r); });
+
+  const waveDurations = [];
+  const longWaveOutcomes = [];
+  const shortWaveOutcomes = [];
+
+  for (let hi=0; hi<horizons.length; hi++) {
+    const h = horizons[hi];
+    const hkey = String(h);
+    const minConfLong = (MIN_CONF_LONG_MAP && MIN_CONF_LONG_MAP[hkey]) ? MIN_CONF_LONG_MAP[hkey] : 0.05;
+    const minConfShort = (MIN_CONF_SHORT_MAP && MIN_CONF_SHORT_MAP[hkey]) ? MIN_CONF_SHORT_MAP[hkey] : 0.02;
+    const minPrecUp = (MIN_PRECISION_UP_MAP && MIN_PRECISION_UP_MAP[hkey]) ? MIN_PRECISION_UP_MAP[hkey] : 0.6;
+    const minPrecDown = (MIN_PRECISION_DOWN_MAP && MIN_PRECISION_DOWN_MAP[hkey]) ? MIN_PRECISION_DOWN_MAP[hkey] : 0.55;
+
+    ["bull","bear"].forEach(function(reg){
+      const key = h + "d::" + reg;
+      const rows = group[key] || [];
+      if (!rows.length) return;
+
+      // UP threshold selection
+      let bestThrUp = 0.5, bestF1Up = -1, bestPrecUp = -1;
+      grid.forEach(function(thr){
+        const labs = rows.map(function(r){ return (r.proba_up != null && r.proba_up >= thr) ? 1 : 0; });
+        const prec = precisionScore(rows.map(function(r){ return r.actual_up; }), labs);
+        const f1 = computeF1(rows.map(function(r){ return r.actual_up; }), labs);
+        if (prec >= minPrecUp && f1 > bestF1Up) { bestF1Up = f1; bestThrUp = thr; bestPrecUp = prec; }
+      });
+      if (bestF1Up < 0) {
+        grid.forEach(function(thr){
+          const labs = rows.map(function(r){ return (r.proba_up != null && r.proba_up >= thr) ? 1 : 0; });
+          const f1 = computeF1(rows.map(function(r){ return r.actual_up; }), labs);
+          if (f1 > bestF1Up) { bestF1Up = f1; bestThrUp = thr; }
+        });
+      }
+
+      // DOWN threshold selection
+      let bestThrDown = 0.5, bestF1Down = -1, bestPrecDown = -1;
+      grid.forEach(function(thr){
+        const labs = rows.map(function(r){ return (r.proba_down != null && r.proba_down >= thr) ? 1 : 0; });
+        const prec = precisionScore(rows.map(function(r){ return r.actual_down; }), labs);
+        const f1 = computeF1(rows.map(function(r){ return r.actual_down; }), labs);
+        if (prec >= minPrecDown && f1 > bestF1Down) { bestF1Down = f1; bestThrDown = thr; bestPrecDown = prec; }
+      });
+      if (bestF1Down < 0) {
+        grid.forEach(function(thr){
+          const labs = rows.map(function(r){ return (r.proba_down != null && r.proba_down >= thr) ? 1 : 0; });
+          const f1 = computeF1(rows.map(function(r){ return r.actual_down; }), labs);
+          if (f1 > bestF1Down) { bestF1Down = f1; bestThrDown = thr; }
+        });
+      }
+
+      // assign preds & final (both LONG and SHORT logic)
+      let totalShortCandidates = 0, totalShortAccepted = 0;
+      rows.forEach(function(r){
+        r.pred_up = (r.proba_up != null && r.proba_up >= bestThrUp) ? 1 : 0;
+        const isDownCandidate = (r.proba_down != null && r.proba_down >= bestThrDown);
+        if (isDownCandidate) totalShortCandidates++;
+
+        r.pred_down = 0;
+        if (isDownCandidate) {
+          const marginDown = r.proba_down - bestThrDown;
+          if ((marginDown >= minConfShort) || (r.proba_down >= HIGH_PROBA_OVERRIDE_DOWN)) {
+            if (ALLOW_SHORT_IN_BULL || r.regime === "bear") { r.pred_down = 1; totalShortAccepted++; }
+          }
+        }
+
+        // long acceptance: respect LONG rules
+        if (r.pred_up === 1) {
+          const marginUp = r.proba_up - bestThrUp;
+          if (!ALLOW_LONG_IN_BEAR && r.regime === "bear") { r.pred_up = 0; } 
+          else if (!(marginUp >= minConfLong || r.proba_up >= HIGH_PROBA_OVERRIDE_UP)) { r.pred_up = 0; }
+        }
+
+        const marginUp = (r.proba_up != null) ? (r.proba_up - bestThrUp) : 0;
+        const marginDown = (r.proba_down != null) ? (r.proba_down - bestThrDown) : 0;
+        if (r.pred_up === 1 && r.pred_down === 1) {
+          if (marginUp > marginDown) { r.final = "LONG"; r.final_conf = marginUp; }
+          else { r.final = "SHORT"; r.final_conf = marginDown; }
+        } else if (r.pred_up === 1) { r.final = "LONG"; r.final_conf = marginUp; }
+        else if (r.pred_down === 1) { r.final = "SHORT"; r.final_conf = marginDown; }
+        else { r.final = "NO"; r.final_conf = 0; }
+
+        // compute duration already available in r.duration_days
+        waveDurations.push({ horizon: h, regime: reg, final: r.final, duration: r.duration_days });
+
+        if (r.final === "LONG") {
+          const realized = r.realized_ret;
+          const outcome = (realized != null && realized > 0) ? "WIN" : "LOSS";
+          longWaveOutcomes.push({
+            horizon: r.horizon,
+            regime: r.regime,
+            start_date: r.date,
+            exit_date: r.exit_date || "",
+            duration_days: r.duration_days,
+            entry_price: r.entry_price || null,
+            exit_price: r.exit_price || null,
+            max_price_in_window: r.max_price_in_window || null,
+            min_price_in_window: r.min_price_in_window || null,
+            realized_ret: realized,
+            outcome: outcome,
+            proba_up: r.proba_up,
+            threshold_up: bestThrUp,
+            final_conf: r.final_conf
+          });
+        } else if (r.final === "SHORT") {
+          const realized = r.realized_ret;
+          const retShort = (realized != null) ? -realized : null;
+          const outcome = (retShort != null && retShort > 0) ? "WIN" : "LOSS";
+          shortWaveOutcomes.push({
+            horizon: r.horizon,
+            regime: r.regime,
+            start_date: r.date,
+            exit_date: r.exit_date || "",
+            duration_days: r.duration_days,
+            entry_price: r.entry_price || null,
+            exit_price: r.exit_price || null,
+            max_price_in_window: r.max_price_in_window || null,
+            min_price_in_window: r.min_price_in_window || null,
+            realized_ret_short: retShort,
+            outcome: outcome,
+            proba_down: r.proba_down,
+            threshold_down: bestThrDown,
+            final_conf: r.final_conf
+          });
+        }
+      });
+
+      logRun("Info: h=" + h + "d reg=" + reg + " shortCandidates=" + totalShortCandidates + " shortAccepted=" + totalShortAccepted);
+
+      // compute metrics & pnl (both sides)
+      const accUp = accuracyScore(rows.map(function(r){ return r.actual_up; }), rows.map(function(r){ return r.pred_up; }));
+      const precUp = precisionScore(rows.map(function(r){ return r.actual_up; }), rows.map(function(r){ return r.pred_up; }));
+      const recUp = recallScore(rows.map(function(r){ return r.actual_up; }), rows.map(function(r){ return r.pred_up; }));
+      const f1Up = computeF1(rows.map(function(r){ return r.actual_up; }), rows.map(function(r){ return r.pred_up; }));
+      const aucUp = rocAuc(rows.map(function(r){ return r.actual_up; }), rows.map(function(r){ return r.proba_up || 0; }));
+
+      const accDown = accuracyScore(rows.map(function(r){ return r.actual_down; }), rows.map(function(r){ return r.pred_down; }));
+      const precDown = precisionScore(rows.map(function(r){ return r.actual_down; }), rows.map(function(r){ return r.pred_down; }));
+      const recDown = recallScore(rows.map(function(r){ return r.actual_down; }), rows.map(function(r){ return r.pred_down; }));
+      const f1Down = computeF1(rows.map(function(r){ return r.actual_down; }), rows.map(function(r){ return r.pred_down; }));
+      const aucDown = rocAuc(rows.map(function(r){ return r.actual_down; }), rows.map(function(r){ return r.proba_down || 0; }));
+
+      metrics.push({
+        horizon: h + "d",
+        regime: reg,
+        threshold_up: bestThrUp, accuracy_up: accUp, precision_up: precUp, recall_up: recUp, f1_up: f1Up, roc_auc_up: aucUp,
+        threshold_down: bestThrDown, accuracy_down: accDown, precision_down: precDown, recall_down: recDown, f1_down: f1Down, roc_auc_down: aucDown,
+        n_obs: rows.length
+      });
+
+      // PnL sim
+      let equityLong = 1.0, equityShort = 1.0, equityCombined = 1.0;
+      const longTrades = [], shortTrades = [];
+      rows.forEach(function(r){
+        if (r.final === "LONG" && r.realized_ret != null) {
+          longTrades.push(r.realized_ret);
+          equityLong *= (1 + r.realized_ret);
+          equityCombined *= (1 + r.realized_ret);
+        } else if (r.final === "SHORT" && r.realized_ret != null) {
+          const retShort = -r.realized_ret;
+          shortTrades.push(retShort);
+          equityShort *= (1 + retShort);
+          equityCombined *= (1 + retShort);
+        }
+      });
+      const totalReturnLong = equityLong - 1;
+      const totalReturnShort = equityShort - 1;
+      const totalReturnCombined = equityCombined - 1;
+      const avgLong = longTrades.length ? (longTrades.reduce(function(a,b){return a+b;},0)/longTrades.length) : 0;
+      const avgShort = shortTrades.length ? (shortTrades.reduce(function(a,b){return a+b;},0)/shortTrades.length) : 0;
+      const winLong = longTrades.length ? (longTrades.filter(function(x){ return x>0; }).length / longTrades.length) : 0;
+      const winShort = shortTrades.length ? (shortTrades.filter(function(x){ return x>0; }).length / shortTrades.length) : 0;
+      const sdLong = longTrades.length ? Math.sqrt(longTrades.reduce(function(a,b){ return a+Math.pow(b-avgLong,2); },0)/longTrades.length) : 0;
+      const sdShort = shortTrades.length ? Math.sqrt(shortTrades.reduce(function(a,b){ return a+Math.pow(b-avgShort,2); },0)/shortTrades.length) : 0;
+      const sharpeLong = sdLong ? (avgLong / sdLong) * Math.sqrt(365/h) : 0;
+      const sharpeShort = sdShort ? (avgShort / sdShort) * Math.sqrt(365/h) : 0;
+      const maxDDLong = maxDrawdownSeriesFromTrades(rows, "LONG");
+      const maxDDShort = maxDrawdownSeriesFromTrades(rows, "SHORT");
+
+      pnlSummary.push({
+        horizon: h + "d", regime: reg,
+        n_long: longTrades.length, n_short: shortTrades.length,
+        total_return_long: totalReturnLong, avg_trade_long: avgLong, winrate_long: winLong, sharpe_long: sharpeLong, maxdd_long: maxDDLong,
+        total_return_short: totalReturnShort, avg_trade_short: avgShort, winrate_short: winShort, sharpe_short: sharpeShort, maxdd_short: maxDDShort,
+        total_return_combined: totalReturnCombined
+      });
+    });
+  }
+
+  const waveSummary = buildWaveDurationSummary(waveDurations);
+  return { metrics: metrics, pnlSummary: pnlSummary, waveSummary: waveSummary, longWaveOutcomes: longWaveOutcomes, shortWaveOutcomes: shortWaveOutcomes };
+}
+
+/* ========== BUILD WAVE DURATION SUMMARY ========== */
+function buildWaveDurationSummary(arr) {
+  const byKey = {};
+  arr.forEach(function(d){
+    const key = d.horizon + "::" + d.regime + "::" + (d.final || "NO");
+    if (!byKey[key]) byKey[key] = [];
+    const dur = (d.duration != null) ? d.duration : (d.duration_days != null ? d.duration_days : null);
+    if (dur != null) byKey[key].push(dur);
+  });
+  const rows = [];
+  Object.keys(byKey).forEach(function(k){
+    const parts = k.split("::");
+    const h = parts[0], reg = parts[1], fin = parts[2];
+    const a = byKey[k].sort(function(a,b){return a-b;});
+    if (!a.length) return;
+    const n = a.length;
+    const sum = a.reduce(function(x,y){ return x + y; }, 0);
+    const avg = sum / n;
+    const median = (n % 2 === 1) ? a[(n-1)/2] : ((a[n/2 - 1] + a[n/2]) / 2);
+    rows.push({
+      horizon: h + "d",
+      regime: reg,
+      final: fin,
+      count: n,
+      avg_duration_days: Math.round(avg * 100) / 100,
+      median_duration_days: Math.round(median * 100) / 100
+    });
+  });
+  return rows;
+}
+
+/* ========== HELPERS & METRICS ========== */
+function maxDrawdownSeriesFromTrades(rows, side) {
+  let eq = 1, peak = 1, maxdd = 0;
+  rows.forEach(function(r) {
+    if (side === "LONG" && r.final === "LONG" && r.realized_ret != null) { eq *= (1 + r.realized_ret); }
+    if (side === "SHORT" && r.final === "SHORT" && r.realized_ret != null) { eq *= (1 + (-r.realized_ret)); }
+    if (eq > peak) peak = eq;
+    const dd = (peak - eq) / peak; if (dd > maxdd) maxdd = dd;
+  });
+  return Math.round(maxdd * 10000) / 10000;
+}
+function accuracyScore(trues, preds){ let ok=0; for (let i=0;i<trues.length;i++) if (trues[i]===preds[i]) ok++; return trues.length? Math.round((ok/trues.length)*10000)/10000 : 0; }
+function precisionScore(trues, preds){ let tp=0, fp=0; for (let i=0;i<trues.length;i++){ if (preds[i]===1){ if(trues[i]===1) tp++; else fp++; } } return (tp+fp)===0?0:Math.round((tp/(tp+fp))*10000)/10000; }
+function recallScore(trues, preds){ let tp=0, fn=0; for (let i=0;i<trues.length;i++){ if (trues[i]===1){ if(preds[i]===1) tp++; else fn++; } } return (tp+fn)===0?0:Math.round((tp/(tp+fn))*10000)/10000; }
+function computeF1(trues, preds){ const p = precisionScore(trues,preds), r = recallScore(trues,preds); return (p+r)===0?0:Math.round((2*p*r/(p+r))*10000)/10000; }
+function rocAuc(trues, scores){ const pos=[], neg=[]; for (let i=0;i<trues.length;i++){ if (trues[i]===1) pos.push(scores[i]); else neg.push(scores[i]); } if (pos.length===0||neg.length===0) return 0; let wins=0,ties=0; for (let pi=0;pi<pos.length;pi++){ for (let ni=0;ni<neg.length;ni++){ const p=pos[pi], n=neg[ni]; if (p>n) wins++; else if (p===n) ties++; } } return Math.round(((wins + 0.5*ties)/(pos.length*neg.length))*10000)/10000; }
+
+/* ========== WRITE OUTPUTS (dynamic) ========== */
+function writeOutputs_Dynamic(spreadsheetId, preds, metrics, pnlSummary, waveSummary, longWaveOutcomes, shortWaveOutcomes) {
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    // predictions
+    let sp = ss.getSheetByName("predictions");
+    if (!sp) sp = ss.insertSheet("predictions"); else sp.clear();
+    const header = ["date","horizon","regime","price","entry_price","exit_price","max_price_in_window","min_price_in_window","actual_up","actual_down","proba_up","proba_down","pred_up","pred_down","final","final_conf","duration_days","exit_date","timing","realized_ret"];
+    sp.getRange(1,1,1,header.length).setValues([header]);
+    if (preds && preds.length) {
+      const rows = preds.map(function(r){ return [r.date, r.horizon, r.regime, r.price, r.entry_price, r.exit_price, r.max_price_in_window, r.min_price_in_window, r.actual_up, r.actual_down, r.proba_up, r.proba_down, r.pred_up || 0, r.pred_down || 0, r.final || "NO", r.final_conf || 0, r.duration_days || "", r.exit_date, r.timing, r.realized_ret]; });
+      sp.getRange(2,1,rows.length,header.length).setValues(rows);
+    }
+
+    // metrics_updown
+    let sm = ss.getSheetByName("metrics_updown");
+    if (!sm) sm = ss.insertSheet("metrics_updown"); else sm.clear();
+    const mh = ["horizon","regime","threshold_up","accuracy_up","precision_up","recall_up","f1_up","roc_auc_up","threshold_down","accuracy_down","precision_down","recall_down","f1_down","roc_auc_down","n_obs"];
+    sm.getRange(1,1,1,mh.length).setValues([mh]);
+    if (metrics && metrics.length) {
+      const mrows = metrics.map(function(m){ return [m.horizon,m.regime,m.threshold_up,m.accuracy_up,m.precision_up,m.recall_up,m.f1_up,m.roc_auc_up,m.threshold_down,m.accuracy_down,m.precision_down,m.recall_down,m.f1_down,m.roc_auc_down,m.n_obs]; });
+      sm.getRange(2,1,mrows.length,mh.length).setValues(mrows);
+    }
+
+    // pnl_summary
+    let spnl = ss.getSheetByName("pnl_summary");
+    if (!spnl) spnl = ss.insertSheet("pnl_summary"); else spnl.clear();
+    const ph = ["horizon","regime","n_long","n_short","total_return_long","avg_trade_long","winrate_long","sharpe_long","maxdd_long","total_return_short","avg_trade_short","winrate_short","sharpe_short","maxdd_short","total_return_combined"];
+    spnl.getRange(1,1,1,ph.length).setValues([ph]);
+    if (pnlSummary && pnlSummary.length) {
+      const prows = pnlSummary.map(function(p){ return [p.horizon,p.regime,p.n_long,p.n_short,p.total_return_long,p.avg_trade_long,p.winrate_long,p.sharpe_long,p.maxdd_long,p.total_return_short,p.avg_trade_short,p.winrate_short,p.sharpe_short,p.maxdd_short,p.total_return_combined]; });
+      spnl.getRange(2,1,prows.length,ph.length).setValues(prows);
+    }
+
+    // wave_durations
+    let sw = ss.getSheetByName("wave_durations");
+    if (!sw) sw = ss.insertSheet("wave_durations"); else sw.clear();
+    const wh = ["horizon","regime","final","count","avg_duration_days","median_duration_days"];
+    sw.getRange(1,1,1,wh.length).setValues([wh]);
+    if (waveSummary && waveSummary.length) {
+      const wrows = waveSummary.map(function(w){ return [w.horizon, w.regime, w.final, w.count, w.avg_duration_days, w.median_duration_days]; });
+      sw.getRange(2,1,wrows.length,wh.length).setValues(wrows);
+    }
+
+    // long_wave_outcomes
+    let slo = ss.getSheetByName("long_wave_outcomes");
+    if (!slo) slo = ss.insertSheet("long_wave_outcomes"); else slo.clear();
+    const oh = ["horizon","regime","start_date","exit_date","duration_days","entry_price","exit_price","max_price_in_window","min_price_in_window","realized_ret","outcome","proba_up","threshold_up","final_conf"];
+    slo.getRange(1,1,1,oh.length).setValues([oh]);
+    if (longWaveOutcomes && longWaveOutcomes.length) {
+      const orows = longWaveOutcomes.map(function(o){ return [o.horizon, o.regime, o.start_date, o.exit_date, o.duration_days, o.entry_price, o.exit_price, o.max_price_in_window, o.min_price_in_window, o.realized_ret, o.outcome, o.proba_up, o.threshold_up, o.final_conf]; });
+      slo.getRange(2,1,orows.length,oh.length).setValues(orows);
+    }
+
+    // short_wave_outcomes
+    let sso = ss.getSheetByName("short_wave_outcomes");
+    if (!sso) sso = ss.insertSheet("short_wave_outcomes"); else sso.clear();
+    const shh = ["horizon","regime","start_date","exit_date","duration_days","entry_price","exit_price","max_price_in_window","min_price_in_window","realized_ret_short","outcome","proba_down","threshold_down","final_conf"];
+    sso.getRange(1,1,1,shh.length).setValues([shh]);
+    if (shortWaveOutcomes && shortWaveOutcomes.length) {
+      const srows = shortWaveOutcomes.map(function(o){ return [o.horizon, o.regime, o.start_date, o.exit_date, o.duration_days, o.entry_price, o.exit_price, o.max_price_in_window, o.min_price_in_window, o.realized_ret_short, o.outcome, o.proba_down, o.threshold_down, o.final_conf]; });
+      sso.getRange(2,1,srows.length,shh.length).setValues(srows);
+    }
+
+    logRun("Wrote predictions, metrics_updown, pnl_summary, wave_durations, long_wave_outcomes, short_wave_outcomes.");
+  } catch (e) {
+    logRun("ERROR writeOutputs_Dynamic: " + (e.message || e));
+  }
+}
+
+/* ========== LOG & UTILS ========== */
+function logRun(msg) {
+  try {
+    Logger.log(msg);
+    const ss = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+    let sh = ss.getSheetByName("run_log");
+    if (!sh) sh = ss.insertSheet("run_log");
+    sh.appendRow([new Date().toISOString(), msg]);
+  } catch (e) {
+    try { Logger.log("LOG FALLBACK: " + msg); } catch (e2) {}
+  }
+}
+function parseDate(v) {
+  if (v == null) return null;
+  if (Object.prototype.toString.call(v) === "[object Date]") { if (isNaN(v.getTime())) return null; return formatYMD(v); }
+  const s = String(v).trim(); if (!s) return null;
+  const d = new Date(s); if (!isNaN(d.getTime())) return formatYMD(d);
+  const m = s.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) { const dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])); return formatYMD(dt); }
+  return null;
+}
+function formatYMD(dt) { const yyyy = dt.getFullYear(); const mm = ("0" + (dt.getMonth() + 1)).slice(-2); const dd = ("0" + dt.getDate()).slice(-2); return yyyy + "-" + mm + "-" + dd; }
+function range(a,b){ const out=[]; for(let i=a;i<b;i++) out.push(i); return out; }
